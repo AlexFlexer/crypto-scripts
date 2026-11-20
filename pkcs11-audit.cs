@@ -165,22 +165,71 @@ public static class CryptoUtils
 
         List<IObjectAttribute> values = session.GetAttributeValue(privateKey, rsaAttributes);
 
-        // Load components into .NET's native RSA class to export as PEM
-        var rsaParams = new RSAParameters
+        // Helper: strip leading 0x00 bytes from big-endian unsigned integer
+        static byte[] TrimLeadingZeros(byte[] data)
         {
-            Modulus = values[0].GetValueAsByteArray(),
-            Exponent = values[1].GetValueAsByteArray(),
-            D = values[2].GetValueAsByteArray(),
-            P = values[3].GetValueAsByteArray(),
-            Q = values[4].GetValueAsByteArray(),
-            DP = values[5].GetValueAsByteArray(),
-            DQ = values[6].GetValueAsByteArray(),
-            InverseQ = values[7].GetValueAsByteArray()
-        };
+            if (data == null || data.Length == 0) return Array.Empty<byte>();
+            int i = 0;
+            while (i < data.Length - 1 && data[i] == 0) i++;
+            return data[i..];
+        }
 
-        using RSA rsa = RSA.Create(rsaParams);
-        string pem = rsa.ExportPkcs8PrivateKeyPem();
-        Console.WriteLine("\nExtracted PEM Private Key:\n" + pem);
+        // Helper: left-pad with 0x00 to reach exact target length required by Windows CNG
+        static byte[] NormalizeLength(byte[] data, int targetLen)
+        {
+            byte[] trimmed = TrimLeadingZeros(data);
+            if (trimmed.Length == targetLen) return trimmed;
+            if (trimmed.Length > targetLen)
+                throw new InvalidOperationException(
+                    $"Component length ({trimmed.Length}) exceeds expected ({targetLen}).");
+
+            byte[] padded = new byte[targetLen];
+            Buffer.BlockCopy(trimmed, 0, padded, targetLen - trimmed.Length, trimmed.Length);
+            return padded;
+        }
+
+        byte[] modulus = TrimLeadingZeros(values[0].GetValueAsByteArray());
+        int modLen = modulus.Length;
+        int halfLen = (modLen + 1) / 2;
+
+        byte[] exponent = TrimLeadingZeros(values[1].GetValueAsByteArray());
+        byte[] d = NormalizeLength(values[2].GetValueAsByteArray(), modLen);
+
+        // Check if CRT parameters (P, Q, DP, DQ, InverseQ) are populated by the token
+        bool hasCrt = !values[3].CannotBeRead && values[3].GetValueAsByteArray()?.Length > 0 &&
+                      !values[4].CannotBeRead && values[4].GetValueAsByteArray()?.Length > 0;
+
+        if (hasCrt)
+        {
+            var rsaParams = new RSAParameters
+            {
+                Modulus = modulus,
+                Exponent = exponent,
+                D = d,
+                P = NormalizeLength(values[3].GetValueAsByteArray(), halfLen),
+                Q = NormalizeLength(values[4].GetValueAsByteArray(), halfLen),
+                DP = NormalizeLength(values[5].GetValueAsByteArray(), halfLen),
+                DQ = NormalizeLength(values[6].GetValueAsByteArray(), halfLen),
+                InverseQ = NormalizeLength(values[7].GetValueAsByteArray(), halfLen)
+            };
+
+            using RSA rsa = RSA.Create(rsaParams);
+            Console.WriteLine("\nExtracted PEM Private Key:\n" + rsa.ExportPkcs8PrivateKeyPem());
+        }
+        else
+        {
+            // Fallback if token only stores (N, E, D) without P, Q, DP, DQ, InverseQ:
+            // Use BouncyCastle to export PKCS#8 directly from (N, E, D)
+            var bcKey = new Org.BouncyCastle.Crypto.Parameters.RsaKeyParameters(
+                isPrivate: true,
+                new Org.BouncyCastle.Math.BigInteger(1, modulus),
+                new Org.BouncyCastle.Math.BigInteger(1, d));
+
+            byte[] pkcs8 = Org.BouncyCastle.Pkcs.PrivateKeyInfoFactory.CreatePrivateKeyInfo(bcKey).GetEncoded();
+            Console.WriteLine("\nExtracted PKCS#8 Base64 (Non-CRT):\n-----BEGIN PRIVATE KEY-----\n" +
+                              Convert.ToBase64String(pkcs8, Base64FormattingOptions.InsertLineBreaks) +
+                              "\n-----END PRIVATE KEY-----");
+        }
     }
 
     private static void GenerateKeyOnMachineAndExportOnToken(ISession session, string label, byte[] ckaId,
