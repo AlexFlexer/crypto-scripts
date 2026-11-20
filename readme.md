@@ -8,12 +8,12 @@ I chose dotnet because I mostly work with c# at this point of my life, and dotne
 ## PKCS#11 audit
 A simple tool that checks private keys on pkcs11 devices for extractability. Supports two operational modes:
 
-1. **Testing.** Generates private RSA-keys right on the device using weak configs (extractable = true).
+1. **Testing.** Tries to extract private RSA-keys from the token, outputs them in PEM-format if succeeds.
 ```
 dotnet run pkcs11-audit.cs -- --module "D:\SoftHSM2\lib\softhsm2-x64.dll" --pin 0000 --manufacturer softhsm --label mytoken --testing true
 ```
 
-2. **Not testing.** Tries to extract private RSA-keys from the token, outputs them in PEM-format if succeeds. Supports two modes:
+2. **Not testing.** Generates private RSA-keys right on the device using weak configs (extractable = true). Supports two modes:
 
 Keys generated on token:
 ```
