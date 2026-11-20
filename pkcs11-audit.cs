@@ -112,6 +112,9 @@ public class AuditArgs
     [Option("gen-keys-on-token", 
         HelpText = "Decides whether private keys should be generated on user side or on token side")]
     public string? GenerateKeysOnToken { get; set; }
+    
+    [Option("rsa-size", HelpText = "Size of rsa key to be generated")]
+    public int RsaKeySize { get; set; } = 2048;
 }
 
 public static class CryptoUtils
@@ -332,7 +335,7 @@ public static class CryptoUtils
             session.Factories.ObjectAttributeFactory.Create(CKA.CKA_VERIFY, true),
             session.Factories.ObjectAttributeFactory.Create(CKA.CKA_VERIFY_RECOVER, true),
             session.Factories.ObjectAttributeFactory.Create(CKA.CKA_WRAP, false),
-            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_MODULUS_BITS, 2048),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_MODULUS_BITS, (nuint)AppState.ParsedArgs.RsaKeySize),
             session.Factories.ObjectAttributeFactory.Create(CKA.CKA_PUBLIC_EXPONENT, [0x01, 0x00, 0x01]),
         ];
 
@@ -360,7 +363,7 @@ public static class CryptoUtils
 
     private static X509Certificate2 GenerateCertificate(string subjectName)
     {
-        using var rsa = RSA.Create(2048);
+        using var rsa = RSA.Create(AppState.ParsedArgs.RsaKeySize);
         var request = new CertificateRequest($"CN={subjectName}", rsa, HashAlgorithmName.SHA256,
             RSASignaturePadding.Pkcs1);
 
