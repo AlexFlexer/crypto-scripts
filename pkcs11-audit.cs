@@ -60,6 +60,7 @@ CryptoUtils.WorkWithToken(AppState.ParsedArgs.Pkcs11Module!, AppState.ParsedArgs
                         else
                         {
                             Console.WriteLine("Key is sensitive. Exporting via Key Wrap...");
+                            Console.WriteLine($"Key wrap mode: {AppState.ParsedArgs.WrappingKeyType}");
                             CryptoUtils.ExtractWrappedKey(slot, session, factories, privateKey);
                         }
                     }
@@ -108,13 +109,16 @@ public class AuditArgs
     [Option("testing", Required = true,
         HelpText = "If true token is only tested, vulnerable key set is generated otherwise")]
     public string? Testing { get; set; }
-    
-    [Option("gen-keys-on-token", 
+
+    [Option("gen-keys-on-token",
         HelpText = "Decides whether private keys should be generated on user side or on token side")]
     public string? GenerateKeysOnToken { get; set; }
     
-    [Option("rsa-size", HelpText = "Size of rsa key to be generated")]
+    [Option("rsa-size", HelpText = "Size of rsa key to be generated (2048 default)")]
     public int RsaKeySize { get; set; } = 2048;
+
+    [Option("wrap-type", HelpText = "Type of wrapping for sensitive keys; must be aes or rsa (aes default)")]
+    public string? WrappingKeyType { get; set; } = "aes";
 }
 
 public static class CryptoUtils
@@ -399,6 +403,99 @@ public static class CryptoUtils
     }
 
     public static void ExtractWrappedKey(ISlot slot, ISession session, Pkcs11InteropFactories factories,
+        IObjectHandle privateKey)
+    {
+        switch (AppState.ParsedArgs.WrappingKeyType?.ToLowerInvariant())
+        {
+            case "aes":
+                ExtractWrappedKeyAesWrap(slot, session, factories, privateKey);
+                break;
+            
+            case "rsa":
+                ExtractWrappedKeyRsaWrap(slot, session, factories, privateKey);
+                break;
+            
+            default:
+                throw new Exception($"Unknown key wrapping type: {AppState.ParsedArgs.WrappingKeyType}");
+        }
+    }
+
+    private static void ExtractWrappedKeyAesWrap(ISlot slot, ISession session, Pkcs11InteropFactories factories,
+        IObjectHandle privateKey)
+    {
+        // 1. Discover all mechanisms on this slot that support wrapping
+        var supportedWrapMechs = slot.GetMechanismList()
+            .Where(m => slot.GetMechanismInfo(m).MechanismFlags.Wrap)
+            .ToHashSet();
+
+        // 2. Pick the best AES wrapping mechanism in order of preference
+        CKM chosenMech;
+        if (supportedWrapMechs.Contains(CKM.CKM_AES_KEY_WRAP_PAD))
+            chosenMech = CKM.CKM_AES_KEY_WRAP_PAD;
+        else if (supportedWrapMechs.Contains(CKM.CKM_AES_KEY_WRAP))
+            chosenMech = CKM.CKM_AES_KEY_WRAP;
+        else if (supportedWrapMechs.Contains(CKM.CKM_AES_CBC_PAD))
+            chosenMech = CKM.CKM_AES_CBC_PAD;
+        else
+            throw new NotSupportedException(
+                "No supported AES wrap mechanism found. Available wrap mechanisms: " +
+                string.Join(", ", supportedWrapMechs));
+
+        Console.WriteLine($"Selected wrapping mechanism: {chosenMech}");
+
+        // 3. Create ephemeral AES-256 session wrapping key
+        byte[] rawAesKey = RandomNumberGenerator.GetBytes(32);
+        var wrapKeyTemplate = new List<IObjectAttribute>
+        {
+            factories.ObjectAttributeFactory.Create(CKA.CKA_CLASS, CKO.CKO_SECRET_KEY),
+            factories.ObjectAttributeFactory.Create(CKA.CKA_KEY_TYPE, CKK.CKK_AES),
+            factories.ObjectAttributeFactory.Create(CKA.CKA_VALUE, rawAesKey),
+            factories.ObjectAttributeFactory.Create(CKA.CKA_TOKEN, false),
+            factories.ObjectAttributeFactory.Create(CKA.CKA_WRAP, true)
+        };
+
+        IObjectHandle wrappingKey = session.CreateObject(wrapKeyTemplate);
+
+        try
+        {
+            byte[] iv = RandomNumberGenerator.GetBytes(16);
+
+            // 4. Build mechanism parameters (only CKM_AES_CBC_PAD takes a 16-byte IV)
+            using IMechanism mechanism = chosenMech == CKM.CKM_AES_CBC_PAD
+                ? factories.MechanismFactory.Create(chosenMech, iv)
+                : factories.MechanismFactory.Create(chosenMech);
+
+            byte[] wrappedKeyBytes = session.WrapKey(mechanism, wrappingKey, privateKey);
+
+            // 5. Unwrap locally using the matching algorithm
+            byte[] pkcs8DerBytes = chosenMech switch
+            {
+                CKM.CKM_AES_KEY_WRAP_PAD => UnwrapRfc5649(wrappedKeyBytes, rawAesKey),
+                CKM.CKM_AES_KEY_WRAP => UnwrapRfc3394(wrappedKeyBytes, rawAesKey),
+                CKM.CKM_AES_CBC_PAD => UnwrapAesCbcPad(wrappedKeyBytes, rawAesKey, iv),
+                _ => throw new NotSupportedException()
+            };
+
+            try
+            {
+                // Load into RSA (or swap for ECDsa.Create() if extracting an EC key)
+                using RSA rsa = RSA.Create();
+                rsa.ImportPkcs8PrivateKey(pkcs8DerBytes, out _);
+                Console.WriteLine("\nUnwrapped PEM Private Key:\n" + rsa.ExportPkcs8PrivateKeyPem());
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(pkcs8DerBytes);
+            }
+        }
+        finally
+        {
+            session.DestroyObject(wrappingKey);
+            CryptographicOperations.ZeroMemory(rawAesKey);
+        }
+    }
+
+    private static void ExtractWrappedKeyRsaWrap(ISlot slot, ISession session, Pkcs11InteropFactories factories,
         IObjectHandle privateKey)
     {
         var supportedWrapMechs = slot.GetMechanismList()
