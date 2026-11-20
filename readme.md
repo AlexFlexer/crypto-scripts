@@ -13,8 +13,16 @@ A simple tool that checks private keys on pkcs11 devices for extractability. Sup
 dotnet run pkcs11-audit.cs -- --module "D:\SoftHSM2\lib\softhsm2-x64.dll" --pin 0000 --manufacturer softhsm --label mytoken --testing true
 ```
 
-2. **Not testing.** Tries to extract private RSA-keys from the token, outputs them in PER-format if succeeds.
+2. **Not testing.** Tries to extract private RSA-keys from the token, outputs them in PER-format if succeeds. Supports two modes:
+
+Keys generated on token:
 ```
-dotnet run pkcs11-audit.cs -- --module "D:\SoftHSM2\lib\softhsm2-x64.dll" --pin 0000 --manufacturer softhsm --label mytoken --testing false
+dotnet run pkcs11-audit.cs -- --module "D:\SoftHSM2\lib\softhsm2-x64.dll" --pin 0000 --manufacturer softhsm --label mytoken --testing false --gen-keys-on-token true
 ```
 
+Keys generated on user machine first, and exported on token afterward:
+```
+dotnet run pkcs11-audit.cs -- --module "D:\SoftHSM2\lib\softhsm2-x64.dll" --pin 0000 --manufacturer softhsm --label mytoken --testing false --gen-keys-on-token false
+```
+
+By default, keys are generated on token.
