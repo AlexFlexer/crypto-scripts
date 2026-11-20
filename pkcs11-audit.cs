@@ -46,6 +46,7 @@ CryptoUtils.WorkWithToken(AppState.ParsedArgs.Pkcs11Module!, AppState.ParsedArgs
                     if (!isExtractable)
                     {
                         Console.WriteLine("Extraction blocked: CKA_EXTRACTABLE is FALSE.");
+                        continue;
                     }
 
                     if (!isSensitive)
