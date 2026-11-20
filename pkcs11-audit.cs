@@ -33,33 +33,39 @@ CryptoUtils.WorkWithToken(AppState.ParsedArgs.Pkcs11Module!, AppState.ParsedArgs
                     { factories.ObjectAttributeFactory.Create(CKA.CKA_CLASS, CKO.CKO_PRIVATE_KEY) };
                 foreach (var privateKey in session.FindAllObjects(searchTemplate))
                 {
-                    // 4. Inspect CKA_EXTRACTABLE and CKA_SENSITIVE
-                    var flagAttrs = session.GetAttributeValue(privateKey, [
-                        CKA.CKA_EXTRACTABLE,
-                        CKA.CKA_SENSITIVE,
-                        CKA.CKA_LABEL
-                    ]);
-                    var isExtractable = flagAttrs[0].GetValueAsBool();
-                    var isSensitive = flagAttrs[1].GetValueAsBool();
-                    var label = flagAttrs[2].GetValueAsString();
-
-                    Console.WriteLine($"Processing key labeled as: {label}");
-
-                    if (!isExtractable)
+                    try
                     {
-                        Console.WriteLine("Extraction blocked: CKA_EXTRACTABLE is FALSE.");
-                        continue;
+                        var flagAttrs = session.GetAttributeValue(privateKey, [
+                            CKA.CKA_EXTRACTABLE,
+                            CKA.CKA_SENSITIVE,
+                            CKA.CKA_LABEL
+                        ]);
+                        var isExtractable = flagAttrs[0].GetValueAsBool();
+                        var isSensitive = flagAttrs[1].GetValueAsBool();
+                        var label = flagAttrs[2].GetValueAsString();
+
+                        Console.WriteLine($"Processing key labeled as: {label}");
+
+                        if (!isExtractable)
+                        {
+                            Console.WriteLine("Extraction blocked: CKA_EXTRACTABLE is FALSE.");
+                            continue;
+                        }
+
+                        if (!isSensitive)
+                        {
+                            Console.WriteLine("Key is non-sensitive. Reading components directly...");
+                            CryptoUtils.ExtractPlaintextRsaKey(session, privateKey);
+                        }
+                        else
+                        {
+                            Console.WriteLine("Key is sensitive. Exporting via AES Key Wrap...");
+                            CryptoUtils.ExtractWrappedKey(slot, session, factories, privateKey);
+                        }
                     }
-
-                    if (!isSensitive)
+                    catch (Exception e)
                     {
-                        Console.WriteLine("Key is non-sensitive. Reading components directly...");
-                        CryptoUtils.ExtractPlaintextRsaKey(session, privateKey);
-                    }
-                    else
-                    {
-                        Console.WriteLine("Key is sensitive. Exporting via AES Key Wrap...");
-                        CryptoUtils.ExtractWrappedKey(slot, session, factories, privateKey);
+                        Console.WriteLine(e);
                     }
                 }
             }
