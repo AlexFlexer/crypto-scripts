@@ -59,7 +59,7 @@ CryptoUtils.WorkWithToken(AppState.ParsedArgs.Pkcs11Module!, AppState.ParsedArgs
                         }
                         else
                         {
-                            Console.WriteLine("Key is sensitive. Exporting via AES Key Wrap...");
+                            Console.WriteLine("Key is sensitive. Exporting via Key Wrap...");
                             CryptoUtils.ExtractWrappedKey(slot, session, factories, privateKey);
                         }
                     }
@@ -398,75 +398,63 @@ public static class CryptoUtils
     public static void ExtractWrappedKey(ISlot slot, ISession session, Pkcs11InteropFactories factories,
         IObjectHandle privateKey)
     {
-        // 1. Discover all mechanisms on this slot that support wrapping
         var supportedWrapMechs = slot.GetMechanismList()
             .Where(m => slot.GetMechanismInfo(m).MechanismFlags.Wrap)
             .ToHashSet();
 
-        // 2. Pick the best AES wrapping mechanism in order of preference
-        CKM chosenMech;
-        if (supportedWrapMechs.Contains(CKM.CKM_AES_KEY_WRAP_PAD))
-            chosenMech = CKM.CKM_AES_KEY_WRAP_PAD;
-        else if (supportedWrapMechs.Contains(CKM.CKM_AES_KEY_WRAP))
-            chosenMech = CKM.CKM_AES_KEY_WRAP;
-        else if (supportedWrapMechs.Contains(CKM.CKM_AES_CBC_PAD))
-            chosenMech = CKM.CKM_AES_CBC_PAD;
-        else
-            throw new NotSupportedException(
-                "No supported AES wrap mechanism found. Available wrap mechanisms: " +
-                string.Join(", ", supportedWrapMechs));
-
-        Console.WriteLine($"Selected wrapping mechanism: {chosenMech}");
-
-        // 3. Create ephemeral AES-256 session wrapping key
-        byte[] rawAesKey = RandomNumberGenerator.GetBytes(32);
-        var wrapKeyTemplate = new List<IObjectAttribute>
+        if (!supportedWrapMechs.Contains(CKM.CKM_RSA_PKCS))
         {
-            factories.ObjectAttributeFactory.Create(CKA.CKA_CLASS, CKO.CKO_SECRET_KEY),
-            factories.ObjectAttributeFactory.Create(CKA.CKA_KEY_TYPE, CKK.CKK_AES),
-            factories.ObjectAttributeFactory.Create(CKA.CKA_VALUE, rawAesKey),
+            Console.WriteLine("CKM_RSA_PKCS not available. Supported wrap mechs: " +
+                              string.Join(", ", supportedWrapMechs));
+            return;
+        }
+
+        // 1. Generate an ephemeral 4096-bit RSA keypair locally (must be larger than the target key)
+        IMechanismInfo rsaInfo = slot.GetMechanismInfo(CKM.CKM_RSA_PKCS);
+        int maxBits = (int)rsaInfo.MaxKeySize; // Often 2048 on smart cards
+        Console.WriteLine($"Token RSA key size range: {rsaInfo.MinKeySize} - {maxBits} bits");
+
+        int wrapKeyBits = Math.Min(4096, maxBits);
+        using RSA localWrapRsa = RSA.Create(wrapKeyBits);
+        RSAParameters pubParams = localWrapRsa.ExportParameters(includePrivateParameters: false);
+
+        // 2. Import the ephemeral RSA public key onto the token with CKA_WRAP = true
+        var pubWrapTemplate = new List<IObjectAttribute>
+        {
+            factories.ObjectAttributeFactory.Create(CKA.CKA_CLASS, CKO.CKO_PUBLIC_KEY),
+            factories.ObjectAttributeFactory.Create(CKA.CKA_KEY_TYPE, CKK.CKK_RSA),
+            factories.ObjectAttributeFactory.Create(CKA.CKA_MODULUS, pubParams.Modulus),
+            factories.ObjectAttributeFactory.Create(CKA.CKA_PUBLIC_EXPONENT, pubParams.Exponent),
             factories.ObjectAttributeFactory.Create(CKA.CKA_TOKEN, false),
+            factories.ObjectAttributeFactory.Create(CKA.CKA_PRIVATE, false),
+            factories.ObjectAttributeFactory.Create(CKA.CKA_ENCRYPT, false),
+            factories.ObjectAttributeFactory.Create(CKA.CKA_VERIFY, false),
             factories.ObjectAttributeFactory.Create(CKA.CKA_WRAP, true)
         };
 
-        IObjectHandle wrappingKey = session.CreateObject(wrapKeyTemplate);
+        IObjectHandle wrappingPubKey = session.CreateObject(pubWrapTemplate);
 
         try
         {
-            byte[] iv = RandomNumberGenerator.GetBytes(16);
+            using IMechanism mech = factories.MechanismFactory.Create(CKM.CKM_RSA_PKCS);
+            byte[] wrappedKeyBytes = session.WrapKey(mech, wrappingPubKey, privateKey);
 
-            // 4. Build mechanism parameters (only CKM_AES_CBC_PAD takes a 16-byte IV)
-            using IMechanism mechanism = chosenMech == CKM.CKM_AES_CBC_PAD
-                ? factories.MechanismFactory.Create(chosenMech, iv)
-                : factories.MechanismFactory.Create(chosenMech);
+            // 3. Decrypt locally with our ephemeral RSA private key
+            byte[] pkcs8DerBytes = localWrapRsa.Decrypt(wrappedKeyBytes, RSAEncryptionPadding.Pkcs1);
 
-            byte[] wrappedKeyBytes = session.WrapKey(mechanism, wrappingKey, privateKey);
-
-            // 5. Unwrap locally using the matching algorithm
-            byte[] pkcs8DerBytes = chosenMech switch
-            {
-                CKM.CKM_AES_KEY_WRAP_PAD => UnwrapRfc5649(wrappedKeyBytes, rawAesKey),
-                CKM.CKM_AES_KEY_WRAP => UnwrapRfc3394(wrappedKeyBytes, rawAesKey),
-                CKM.CKM_AES_CBC_PAD => UnwrapAesCbcPad(wrappedKeyBytes, rawAesKey, iv),
-                _ => throw new NotSupportedException()
-            };
-
-            try
-            {
-                // Load into RSA (or swap for ECDsa.Create() if extracting an EC key)
-                using RSA rsa = RSA.Create();
-                rsa.ImportPkcs8PrivateKey(pkcs8DerBytes, out _);
-                Console.WriteLine("\nUnwrapped PEM Private Key:\n" + rsa.ExportPkcs8PrivateKeyPem());
-            }
-            finally
-            {
-                CryptographicOperations.ZeroMemory(pkcs8DerBytes);
-            }
+            using RSA extractedRsa = RSA.Create();
+            extractedRsa.ImportPkcs8PrivateKey(pkcs8DerBytes, out _);
+            Console.WriteLine("\nUnwrapped PEM Private Key:\n" + extractedRsa.ExportPkcs8PrivateKeyPem());
+            CryptographicOperations.ZeroMemory(pkcs8DerBytes);
+        }
+        catch (Pkcs11Exception ex) when (ex.RV == CKR.CKR_FUNCTION_NOT_SUPPORTED)
+        {
+            Console.WriteLine(
+                "Token driver does not implement C_WrapKey (CKR_FUNCTION_NOT_SUPPORTED). Sensitive keys cannot be exported.");
         }
         finally
         {
-            session.DestroyObject(wrappingKey);
-            CryptographicOperations.ZeroMemory(rawAesKey);
+            session.DestroyObject(wrappingPubKey);
         }
     }
 
