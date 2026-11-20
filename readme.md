@@ -26,3 +26,26 @@ dotnet run pkcs11-audit.cs -- --module "D:\SoftHSM2\lib\softhsm2-x64.dll" --pin 
 ```
 
 By default, keys are generated on token.
+
+Full commands list can be found in the --help menu:
+```
+  --module               Required. PKCS#11 .dll module for interaction with token
+
+  --pin                  Required. PIN code for token operations
+
+  --manufacturer         Required. Manufacturer ID of the token
+
+  --label                Required. Label of the token
+
+  --testing              Required. If true token is only tested, vulnerable key set is generated otherwise
+
+  --gen-keys-on-token    Decides whether private keys should be generated on user side or on token side
+
+  --rsa-size             Size of rsa key to be generated (2048 default)
+
+  --wrap-type            Type of wrapping for sensitive keys; must be aes or rsa (aes default)
+
+  --help                 Display this help screen.
+
+  --version              Display version information.
+```
