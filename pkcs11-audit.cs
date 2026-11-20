@@ -137,7 +137,8 @@ public static class CryptoUtils
         test(slot, session, factories);
     }
 
-    public static void GeneratePrivKeyWithFlags(ISession session, bool extractable, bool sensitive, bool generateOnToken)
+    public static void GeneratePrivKeyWithFlags(ISession session, bool extractable, bool sensitive,
+        bool generateOnToken)
     {
         // The CKA_ID attribute is intended as a means of distinguishing multiple key pairs held by the same subject
         byte[] ckaId = session.GenerateRandom(20);
@@ -165,24 +166,32 @@ public static class CryptoUtils
 
         List<IObjectAttribute> values = session.GetAttributeValue(privateKey, rsaAttributes);
 
-        // Helper: strip leading 0x00 bytes from big-endian unsigned integer
+        // 1. Print diagnostic info for every RSA component
+        for (int i = 0; i < rsaAttributes.Count; i++)
+        {
+            byte[]? raw = values[i].CannotBeRead ? null : values[i].GetValueAsByteArray();
+            Console.WriteLine(
+                $"  {rsaAttributes[i]}: CannotBeRead={values[i].CannotBeRead}, Length={raw?.Length ?? 0}");
+        }
+
+        if (values[2].CannotBeRead || values[2].GetValueAsByteArray() is not { Length: > 0 } rawD ||
+            rawD.All(b => b == 0))
+        {
+            Console.WriteLine(
+                "\nExtraction blocked: Token refused to return CKA_PRIVATE_EXPONENT (hardware enforces sensitivity).");
+            return;
+        }
+
         static byte[] TrimLeadingZeros(byte[] data)
         {
-            if (data == null || data.Length == 0) return Array.Empty<byte>();
             int i = 0;
             while (i < data.Length - 1 && data[i] == 0) i++;
             return data[i..];
         }
 
-        // Helper: left-pad with 0x00 to reach exact target length required by Windows CNG
         static byte[] NormalizeLength(byte[] data, int targetLen)
         {
             byte[] trimmed = TrimLeadingZeros(data);
-            if (trimmed.Length == targetLen) return trimmed;
-            if (trimmed.Length > targetLen)
-                throw new InvalidOperationException(
-                    $"Component length ({trimmed.Length}) exceeds expected ({targetLen}).");
-
             byte[] padded = new byte[targetLen];
             Buffer.BlockCopy(trimmed, 0, padded, targetLen - trimmed.Length, trimmed.Length);
             return padded;
@@ -193,9 +202,8 @@ public static class CryptoUtils
         int halfLen = (modLen + 1) / 2;
 
         byte[] exponent = TrimLeadingZeros(values[1].GetValueAsByteArray());
-        byte[] d = NormalizeLength(values[2].GetValueAsByteArray(), modLen);
+        byte[] d = NormalizeLength(rawD, modLen);
 
-        // Check if CRT parameters (P, Q, DP, DQ, InverseQ) are populated by the token
         bool hasCrt = !values[3].CannotBeRead && values[3].GetValueAsByteArray()?.Length > 0 &&
                       !values[4].CannotBeRead && values[4].GetValueAsByteArray()?.Length > 0;
 
@@ -218,17 +226,67 @@ public static class CryptoUtils
         }
         else
         {
-            // Fallback if token only stores (N, E, D) without P, Q, DP, DQ, InverseQ:
-            // Use BouncyCastle to export PKCS#8 directly from (N, E, D)
-            var bcKey = new Org.BouncyCastle.Crypto.Parameters.RsaKeyParameters(
-                isPrivate: true,
+            // Note: Standard PKCS#8 RSA PrivateKeyInfo requires P, Q, DP, DQ, InverseQ.
+            // If the token only provides (N, E, D), you can derive P and Q mathematically from (N, E, D).
+            var (p, q, dp, dq, invQ) = DeriveRsaCrtFromNed(
                 new Org.BouncyCastle.Math.BigInteger(1, modulus),
+                new Org.BouncyCastle.Math.BigInteger(1, exponent),
                 new Org.BouncyCastle.Math.BigInteger(1, d));
 
-            byte[] pkcs8 = Org.BouncyCastle.Pkcs.PrivateKeyInfoFactory.CreatePrivateKeyInfo(bcKey).GetEncoded();
-            Console.WriteLine("\nExtracted PKCS#8 Base64 (Non-CRT):\n-----BEGIN PRIVATE KEY-----\n" +
-                              Convert.ToBase64String(pkcs8, Base64FormattingOptions.InsertLineBreaks) +
-                              "\n-----END PRIVATE KEY-----");
+            var rsaParams = new RSAParameters
+            {
+                Modulus = modulus,
+                Exponent = exponent,
+                D = d,
+                P = NormalizeLength(p.ToByteArrayUnsigned(), halfLen),
+                Q = NormalizeLength(q.ToByteArrayUnsigned(), halfLen),
+                DP = NormalizeLength(dp.ToByteArrayUnsigned(), halfLen),
+                DQ = NormalizeLength(dq.ToByteArrayUnsigned(), halfLen),
+                InverseQ = NormalizeLength(invQ.ToByteArrayUnsigned(), halfLen)
+            };
+
+            using RSA rsa = RSA.Create(rsaParams);
+            Console.WriteLine("\nExtracted PEM Private Key (CRT derived from N, E, D):\n" +
+                              rsa.ExportPkcs8PrivateKeyPem());
+        }
+    }
+
+    static (Org.BouncyCastle.Math.BigInteger p, Org.BouncyCastle.Math.BigInteger q,
+        Org.BouncyCastle.Math.BigInteger dp, Org.BouncyCastle.Math.BigInteger dq,
+        Org.BouncyCastle.Math.BigInteger invQ) DeriveRsaCrtFromNed(
+            Org.BouncyCastle.Math.BigInteger n,
+            Org.BouncyCastle.Math.BigInteger e,
+            Org.BouncyCastle.Math.BigInteger d)
+    {
+        var One = Org.BouncyCastle.Math.BigInteger.One;
+        var Two = Org.BouncyCastle.Math.BigInteger.Two;
+        var k = e.Multiply(d).Subtract(One);
+        int t = k.GetLowestSetBit();
+        var r = k.ShiftRight(t);
+
+        var rng = new Org.BouncyCastle.Security.SecureRandom();
+        while (true)
+        {
+            var g = Org.BouncyCastle.Utilities.BigIntegers.CreateRandomInRange(Two, n.Subtract(One), rng);
+            var y = g.ModPow(r, n);
+            if (y.Equals(One) || y.Equals(n.Subtract(One))) continue;
+
+            for (int j = 1; j < t; j++)
+            {
+                var x = y.ModPow(Two, n);
+                if (x.Equals(One))
+                {
+                    var p = y.Subtract(One).Gcd(n);
+                    var q = n.Divide(p);
+                    var dp = d.Remainder(p.Subtract(One));
+                    var dq = d.Remainder(q.Subtract(One));
+                    var invQ = q.ModInverse(p);
+                    return (p, q, dp, dq, invQ);
+                }
+
+                if (x.Equals(n.Subtract(One))) break;
+                y = x;
+            }
         }
     }
 
@@ -260,7 +318,8 @@ public static class CryptoUtils
         session.CreateObject(keyAttributes);
     }
 
-    private static void GenerateKeyOnToken(ISession session, string label, byte[] ckaId, bool extractable, bool sensitive)
+    private static void GenerateKeyOnToken(ISession session, string label, byte[] ckaId, bool extractable,
+        bool sensitive)
     {
         // Prepare attribute template of new public key
         List<IObjectAttribute> publicKeyAttributes =
@@ -297,7 +356,7 @@ public static class CryptoUtils
 
         // Generate key pair
         session.GenerateKeyPair(mechanism, publicKeyAttributes, privateKeyAttributes, out _, out _);
-    } 
+    }
 
     private static X509Certificate2 GenerateCertificate(string subjectName)
     {
@@ -320,7 +379,7 @@ public static class CryptoUtils
 
         return certWithPrivateKey;
     }
-    
+
     private static RSAParameters ExportRsaPrivateKey(X509Certificate2 cert)
     {
         using var rsa = cert.GetRSAPrivateKey()!;
