@@ -4,11 +4,10 @@
 #:package BouncyCastle.Cryptography@2.8.0-beta.349
 
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using CommandLine;
 using Net.Pkcs11Interop.Common;
 using Net.Pkcs11Interop.HighLevelAPI;
-using Org.BouncyCastle.Crypto.Engines;
-using Org.BouncyCastle.Crypto.Parameters;
 
 CryptoUtils.WorkWithToken(AppState.ParsedArgs.Pkcs11Module!, AppState.ParsedArgs.ManufacturerId!,
     AppState.ParsedArgs.Label!,
@@ -19,10 +18,13 @@ CryptoUtils.WorkWithToken(AppState.ParsedArgs.Pkcs11Module!, AppState.ParsedArgs
         {
             if (bool.TryParse(AppState.ParsedArgs.Testing, out var res) && !res)
             {
+                bool.TryParse(AppState.ParsedArgs.GenerateKeysOnToken, out var genOnToken);
+                Console.WriteLine($"Keys generated on token: {genOnToken}");
+                
                 Console.WriteLine("Creating set of vulnerable keys...");
-                CryptoUtils.GeneratePrivKeyWithFlags(session, true, true);
+                CryptoUtils.GeneratePrivKeyWithFlags(session, true, true, genOnToken);
                 Console.WriteLine("Generated extractable + sensitive key pair");
-                CryptoUtils.GeneratePrivKeyWithFlags(session, true, false);
+                CryptoUtils.GeneratePrivKeyWithFlags(session, true, false, genOnToken);
                 Console.WriteLine("Generated extractable only key pair");
             }
             else
@@ -100,6 +102,10 @@ public class AuditArgs
     [Option("testing", Required = true,
         HelpText = "If true token is only tested, vulnerable key set is generated otherwise")]
     public string? Testing { get; set; }
+    
+    [Option("gen-keys-on-token", Required = true, 
+        HelpText = "Decides whether private keys should be generated on user side or on token side")]
+    public string? GenerateKeysOnToken { get; set; }
 }
 
 public static class CryptoUtils
@@ -125,12 +131,82 @@ public static class CryptoUtils
         test(slot, session, factories);
     }
 
-    public static void GeneratePrivKeyWithFlags(ISession session, bool extractable, bool sensitive)
+    public static void GeneratePrivKeyWithFlags(ISession session, bool extractable, bool sensitive, bool generateOnToken)
     {
         // The CKA_ID attribute is intended as a means of distinguishing multiple key pairs held by the same subject
         byte[] ckaId = session.GenerateRandom(20);
         var label = $"DTM_{Guid.NewGuid()}";
 
+        if (generateOnToken)
+            GenerateKeyOnToken(session, label, ckaId, extractable, sensitive);
+        else
+            GenerateKeyOnMachineAndExportOnToken(session, label, ckaId, extractable, sensitive);
+    }
+
+    public static void ExtractPlaintextRsaKey(ISession session, IObjectHandle privateKey)
+    {
+        var rsaAttributes = new List<CKA>
+        {
+            CKA.CKA_MODULUS,
+            CKA.CKA_PUBLIC_EXPONENT,
+            CKA.CKA_PRIVATE_EXPONENT,
+            CKA.CKA_PRIME_1,
+            CKA.CKA_PRIME_2,
+            CKA.CKA_EXPONENT_1,
+            CKA.CKA_EXPONENT_2,
+            CKA.CKA_COEFFICIENT
+        };
+
+        List<IObjectAttribute> values = session.GetAttributeValue(privateKey, rsaAttributes);
+
+        // Load components into .NET's native RSA class to export as PEM
+        var rsaParams = new RSAParameters
+        {
+            Modulus = values[0].GetValueAsByteArray(),
+            Exponent = values[1].GetValueAsByteArray(),
+            D = values[2].GetValueAsByteArray(),
+            P = values[3].GetValueAsByteArray(),
+            Q = values[4].GetValueAsByteArray(),
+            DP = values[5].GetValueAsByteArray(),
+            DQ = values[6].GetValueAsByteArray(),
+            InverseQ = values[7].GetValueAsByteArray()
+        };
+
+        using RSA rsa = RSA.Create(rsaParams);
+        string pem = rsa.ExportPkcs8PrivateKeyPem();
+        Console.WriteLine("\nExtracted PEM Private Key:\n" + pem);
+    }
+
+    private static void GenerateKeyOnMachineAndExportOnToken(ISession session, string label, byte[] ckaId,
+        bool extractable, bool sensitive)
+    {
+        var cert = GenerateCertificate("aaa");
+        RSAParameters rsaParams = ExportRsaPrivateKey(cert);
+        var keyAttributes = new List<IObjectAttribute>
+        {
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_CLASS, CKO.CKO_PRIVATE_KEY),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_KEY_TYPE, CKK.CKK_RSA),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_TOKEN, true),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_LABEL, label),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_ID, ckaId),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_PRIVATE, true),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_SENSITIVE, sensitive),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_EXTRACTABLE, extractable),
+            // RSA Components
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_MODULUS, rsaParams.Modulus),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_PUBLIC_EXPONENT, rsaParams.Exponent),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_PRIVATE_EXPONENT, rsaParams.D),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_PRIME_1, rsaParams.P),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_PRIME_2, rsaParams.Q),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_EXPONENT_1, rsaParams.DP),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_EXPONENT_2, rsaParams.DQ),
+            session.Factories.ObjectAttributeFactory.Create(CKA.CKA_COEFFICIENT, rsaParams.InverseQ)
+        };
+        session.CreateObject(keyAttributes);
+    }
+
+    private static void GenerateKeyOnToken(ISession session, string label, byte[] ckaId, bool extractable, bool sensitive)
+    {
         // Prepare attribute template of new public key
         List<IObjectAttribute> publicKeyAttributes =
         [
@@ -166,40 +242,43 @@ public static class CryptoUtils
 
         // Generate key pair
         session.GenerateKeyPair(mechanism, publicKeyAttributes, privateKeyAttributes, out _, out _);
-    }
+    } 
 
-    public static void ExtractPlaintextRsaKey(ISession session, IObjectHandle privateKey)
+    private static X509Certificate2 GenerateCertificate(string subjectName)
     {
-        var rsaAttributes = new List<CKA>
-        {
-            CKA.CKA_MODULUS,
-            CKA.CKA_PUBLIC_EXPONENT,
-            CKA.CKA_PRIVATE_EXPONENT,
-            CKA.CKA_PRIME_1,
-            CKA.CKA_PRIME_2,
-            CKA.CKA_EXPONENT_1,
-            CKA.CKA_EXPONENT_2,
-            CKA.CKA_COEFFICIENT
-        };
+        using var rsa = RSA.Create(2048);
+        var request = new CertificateRequest($"CN={subjectName}", rsa, HashAlgorithmName.SHA256,
+            RSASignaturePadding.Pkcs1);
 
-        List<IObjectAttribute> values = session.GetAttributeValue(privateKey, rsaAttributes);
+        request.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.KeyEncipherment | X509KeyUsageFlags.DataEncipherment, critical: true));
 
-        // Load components into .NET's native RSA class to export as PEM
-        var rsaParams = new RSAParameters
-        {
-            Modulus = values[0].GetValueAsByteArray(),
-            Exponent = values[1].GetValueAsByteArray(),
-            D = values[2].GetValueAsByteArray(),
-            P = values[3].GetValueAsByteArray(),
-            Q = values[4].GetValueAsByteArray(),
-            DP = values[5].GetValueAsByteArray(),
-            DQ = values[6].GetValueAsByteArray(),
-            InverseQ = values[7].GetValueAsByteArray()
-        };
+        var certSelfSigned = request.CreateSelfSigned(DateTime.UtcNow, DateTime.MaxValue);
 
-        using RSA rsa = RSA.Create(rsaParams);
-        string pem = rsa.ExportPkcs8PrivateKeyPem();
-        Console.WriteLine("\nExtracted PEM Private Key:\n" + pem);
+        var export = certSelfSigned.Export(X509ContentType.Pfx, "");
+        var cert = new X509Certificate2(export, "",
+            X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.Exportable);
+
+        // To persist the private key
+        var certWithPubKeyOnly = new X509Certificate2(cert.RawData);
+        var certWithPrivateKey = certWithPubKeyOnly.CopyWithPrivateKey(rsa);
+
+        return certWithPrivateKey;
+    }
+    
+    private static RSAParameters ExportRsaPrivateKey(X509Certificate2 cert)
+    {
+        using var rsa = cert.GetRSAPrivateKey()!;
+        // 1. У вас есть байты закрытого ключа (PKCS#8)
+        byte[] keyBytes = rsa.ExportPkcs8PrivateKey();
+
+        // 2. Создаем временный объект RSA и импортируем байты
+        using RSA tempRsa = RSA.Create();
+        tempRsa.ImportPkcs8PrivateKey(keyBytes, out _);
+
+        // 3. Экспортируем параметры
+        // true означает, что нужно включить закрытые параметры (D, P, Q и т.д.)
+        return tempRsa.ExportParameters(true);
     }
 
     public static void ExtractWrappedKey(ISlot slot, ISession session, Pkcs11InteropFactories factories,
