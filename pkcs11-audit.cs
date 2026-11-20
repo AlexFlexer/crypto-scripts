@@ -109,7 +109,7 @@ public class AuditArgs
         HelpText = "If true token is only tested, vulnerable key set is generated otherwise")]
     public string? Testing { get; set; }
     
-    [Option("gen-keys-on-token", Required = true, 
+    [Option("gen-keys-on-token", 
         HelpText = "Decides whether private keys should be generated on user side or on token side")]
     public string? GenerateKeysOnToken { get; set; }
 }
